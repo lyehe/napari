@@ -426,10 +426,21 @@ class Gaussians(Layer):
                 self._opacities,
                 np.ones(pad)
             ]).astype(np.float32)
-            self._colors = np.vstack([
-                self._colors,
-                np.ones((pad, 3))
-            ]).astype(np.float32)
+
+            # Handle colors - need to preserve SH dimension if present
+            if self._colors.ndim == 2:
+                # Simple RGB colors
+                self._colors = np.vstack([
+                    self._colors,
+                    np.ones((pad, 3))
+                ]).astype(np.float32)
+            else:
+                # SH coefficients (N, K, 3)
+                K = self._colors.shape[1]
+                pad_colors = np.zeros((pad, K, 3), dtype=np.float32)
+                pad_colors[:, 0, :] = 1.0  # DC component = white
+                # Higher order SH coefficients default to 0
+                self._colors = np.concatenate([self._colors, pad_colors], axis=0)
         else:
             # Truncate
             self._rotations = self._rotations[:new_n]
