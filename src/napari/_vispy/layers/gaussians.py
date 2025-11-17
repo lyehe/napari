@@ -92,26 +92,17 @@ class VispyGaussiansLayer(VispyBaseLayer):
         # Get point size multiplier from layer
         point_size_multiplier = self.layer.point_size if hasattr(self.layer, 'point_size') else 1.0
 
-        # Update the visual
-        if hasattr(self.node.gaussian_markers, 'set_gaussian_data'):
-            self.node.gaussian_markers.set_gaussian_data(
-                positions=positions,
-                rotations=rotations,
-                scales=scales,
-                opacities=opacities,
-                colors=colors,
-                view_matrix=view_matrix,
-                point_size_multiplier=point_size_multiplier,
-            )
-        else:
-            # Fallback for simpler implementation
-            self.node.set_data(
-                positions=positions,
-                rotations=rotations,
-                scales=scales,
-                opacities=opacities,
-                colors=colors,
-            )
+        # Update the visual with all parameters
+        # The GaussianSplattingVisual.set_data() now accepts view_matrix and point_size_multiplier
+        self.node.set_data(
+            positions=positions,
+            rotations=rotations,
+            scales=scales,
+            opacities=opacities,
+            colors=colors,
+            view_matrix=view_matrix,
+            point_size_multiplier=point_size_multiplier,
+        )
 
         # Update selection highlights
         self._on_highlight_change()

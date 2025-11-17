@@ -5,7 +5,10 @@ from __future__ import annotations
 from typing import ClassVar
 
 import numpy as np
-from vispy.scene.visuals import Compound, Markers
+from vispy import gloo
+from vispy.scene import visuals
+from vispy.scene.visuals import Compound, Markers, create_visual_node
+from vispy.visuals import Visual
 from vispy.visuals.shaders import Function
 
 from napari._vispy.visuals.clipping_planes_mixin import ClippingPlanesMixin
@@ -158,20 +161,21 @@ class GaussianSplattingVisual(ClippingPlanesMixin, Compound):
     """
     Compound vispy visual for Gaussian Splatting rendering.
 
-    This visual renders 3D Gaussian splats by:
-    1. Projecting 3D Gaussian covariance to 2D screen space
-    2. Rendering each Gaussian as a point sprite
-    3. Evaluating the 2D Gaussian function in the fragment shader
-    4. Alpha blending the results
+    This visual renders 3D Gaussian splats using custom shaders that:
+    1. Project 3D Gaussian covariance to 2D screen space
+    2. Render each Gaussian as a point sprite
+    3. Evaluate the 2D Gaussian function in the fragment shader
+    4. Alpha blend the results
 
     Components:
-        - Markers for Gaussian splats (custom shaders)
-        - Markers for selection highlights
+        - GaussianMarkersNode: Custom visual with full shader implementation
+        - Markers: Selection highlights
     """
 
     def __init__(self) -> None:
-        # Create markers visual with custom shaders for Gaussians
-        self.gaussian_markers = GaussianMarkers()
+        # Create custom Gaussian visual with full shader implementation
+        # Note: We create the node directly (scene-graph version)
+        self.gaussian_markers = GaussianMarkersNode()
         self.selection_markers = Markers()
 
         super().__init__([
@@ -191,22 +195,24 @@ class GaussianSplattingVisual(ClippingPlanesMixin, Compound):
     def point_size(self, value: float) -> None:
         """Set point size multiplier."""
         self._point_size = float(value)
-        if hasattr(self.gaussian_markers, 'shared_program'):
-            self.gaussian_markers.shared_program['u_point_size'] = self._point_size
+        # The point size is passed through set_gaussian_data, not set directly
 
     @property
     def scaling(self) -> bool:
         """
         Scaling property. If True, Gaussians rescale based on zoom
         (constant world-space size).
+
+        Note: For custom shader implementation, scaling is always 'visual'
+        since size calculation happens in the shader.
         """
-        return self.gaussian_markers.scaling == 'visual'
+        return True  # Always true for shader-based rendering
 
     @scaling.setter
     def scaling(self, value: bool) -> None:
-        """Set scaling mode."""
+        """Set scaling mode for selection markers only."""
+        # Gaussian rendering uses shaders, so only set for selection markers
         scaling_txt = 'visual' if value else 'fixed'
-        self.gaussian_markers.scaling = scaling_txt
         self.selection_markers.scaling = scaling_txt
 
     def set_data(
@@ -216,10 +222,12 @@ class GaussianSplattingVisual(ClippingPlanesMixin, Compound):
         scales=None,
         opacities=None,
         colors=None,
+        view_matrix=None,
+        point_size_multiplier=1.0,
         **kwargs
     ) -> None:
         """
-        Set Gaussian data for rendering.
+        Set Gaussian data for rendering using custom shaders.
 
         Parameters
         ----------
@@ -233,22 +241,20 @@ class GaussianSplattingVisual(ClippingPlanesMixin, Compound):
             Opacity values [0, 1]
         colors : array (N, 3)
             RGB colors [0, 1]
+        view_matrix : array (4, 4), optional
+            View matrix for depth sorting
+        point_size_multiplier : float
+            Global size multiplier
         """
-        if positions is None or len(positions) == 0:
-            self.gaussian_markers.set_data(None)
-            return
-
-        # Prepare data for custom shader attributes
-        # The Markers visual will handle positions automatically
-        # We need to add custom attributes for rotations, scales, opacities, colors
-
-        # For now, use standard Markers rendering as a placeholder
-        # TODO: Implement custom VisualNode with proper shader attributes
-        self.gaussian_markers.set_data(
-            pos=positions,
-            face_color=colors if colors is not None else np.ones((len(positions), 3)),
-            edge_color=None,
-            size=10,  # Base size, will be modulated by scales in shader
+        # Use the new custom shader implementation
+        self.gaussian_markers.set_gaussian_data(
+            positions=positions,
+            rotations=rotations,
+            scales=scales,
+            opacities=opacities,
+            colors=colors,
+            view_matrix=view_matrix,
+            point_size_multiplier=point_size_multiplier,
         )
 
     def set_selection_data(self, positions=None, **kwargs) -> None:
@@ -266,30 +272,62 @@ class GaussianSplattingVisual(ClippingPlanesMixin, Compound):
         )
 
 
-class GaussianMarkers(Markers):
+class GaussianMarkers(Visual):
     """
-    Custom Markers visual with Gaussian splatting shaders.
+    Custom Visual with full Gaussian splatting shader implementation.
 
-    This extends vispy's Markers to use custom shaders that:
-    - Accept rotation quaternions, scales, and opacities as attributes
+    This visual implements proper 3D Gaussian rendering using custom shaders that:
+    - Accept rotation quaternions, scales, and opacities as vertex attributes
     - Project 3D Gaussian covariance to 2D screen space
-    - Render each Gaussian with proper alpha blending
+    - Render each Gaussian with proper alpha blending using point sprites
     """
 
-    # NOTE: For full shader implementation, we would need to:
-    # 1. Override _prepare_draw() to set custom shader attributes
-    # 2. Replace the vertex and fragment shaders with GAUSSIAN_VERTEX_SHADER
-    #    and GAUSSIAN_FRAGMENT_SHADER
-    # 3. Add proper attribute handling for rotations, scales, opacities
-    #
-    # This is a simplified placeholder implementation.
-    # Full implementation requires deeper vispy integration.
+    def __init__(self) -> None:
+        super().__init__(vcode=GAUSSIAN_VERTEX_SHADER, fcode=GAUSSIAN_FRAGMENT_SHADER)
 
-    def __init__(self, *args, **kwargs) -> None:
-        super().__init__(*args, **kwargs)
+        # Set up GL state for proper blending and point sprites
+        self.set_gl_state('translucent', depth_test=True, cull_face=False, blend=True,
+                         blend_func=('src_alpha', 'one_minus_src_alpha'))
+
+        # Enable point sprites - this allows gl_PointSize in vertex shader
+        self._draw_mode = 'points'
+
+        # Try to enable program point size (may not be needed in modern GL)
+        try:
+            from vispy import gloo
+            # This will be set during draw
+            self._enable_program_point_size = True
+        except Exception:
+            self._enable_program_point_size = False
+
+        # Initialize data attributes
+        self._n_gaussians = 0
+        self._positions = None
         self._rotations = None
         self._scales = None
         self._opacities = None
+        self._colors = None
+
+        # Vertex buffer objects
+        self._vbo_pos = gloo.VertexBuffer()
+        self._vbo_rot = gloo.VertexBuffer()
+        self._vbo_scale = gloo.VertexBuffer()
+        self._vbo_opacity = gloo.VertexBuffer()
+        self._vbo_color = gloo.VertexBuffer()
+
+        # Shader program
+        self.shared_program['a_position'] = self._vbo_pos
+        self.shared_program['a_rotation'] = self._vbo_rot
+        self.shared_program['a_scale'] = self._vbo_scale
+        self.shared_program['a_opacity'] = self._vbo_opacity
+        self.shared_program['a_color'] = self._vbo_color
+
+        # Initialize uniforms with defaults
+        self.shared_program['u_point_size'] = 1.0
+        self.shared_program['u_viewport'] = (800.0, 600.0)
+
+        # Flag to track if we need to update
+        self._data_changed = False
 
     def set_gaussian_data(
         self,
@@ -306,112 +344,139 @@ class GaussianMarkers(Markers):
 
         Parameters
         ----------
-        positions : array (N, 3)
-            Gaussian centers
+        positions : array (N, 3) or None
+            Gaussian centers in XYZ coordinates
         rotations : array (N, 4)
-            Rotation quaternions
+            Rotation quaternions in XYZW format
         scales : array (N, 3)
             Scale parameters
         opacities : array (N,)
-            Opacity values
+            Opacity values [0, 1]
         colors : array (N, 3)
-            RGB colors
+            RGB colors [0, 1]
         view_matrix : array (4, 4), optional
             View matrix for depth sorting
         point_size_multiplier : float
             Global size multiplier
         """
-        self._rotations = rotations
-        self._scales = scales
-        self._opacities = opacities
+        # Handle empty data
+        if positions is None or len(positions) == 0:
+            self._n_gaussians = 0
+            self._positions = None
+            self._data_changed = True
+            self.update()
+            return
 
-        # Enhanced rendering with depth sorting and better size calculation
-        if positions is not None and len(positions) > 0:
-            try:
-                from napari._vispy.visuals.gaussian_utils import (
-                    apply_opacity_to_colors,
-                    compute_depth_order,
-                    compute_gaussian_sizes,
-                    filter_by_opacity_threshold,
+        # Apply preprocessing: filtering and depth sorting
+        try:
+            from napari._vispy.visuals.gaussian_utils import (
+                compute_depth_order,
+                filter_by_opacity_threshold,
+            )
+
+            # Filter out very transparent Gaussians for performance
+            opacity_threshold = 0.01
+            if opacities is not None and np.any(opacities < opacity_threshold):
+                positions, rotations, scales, opacities, colors = filter_by_opacity_threshold(
+                    positions, rotations, scales, opacities, colors, opacity_threshold
                 )
 
-                # Filter out very transparent Gaussians for performance
-                opacity_threshold = 0.01
-                if opacities is not None and np.any(opacities < opacity_threshold):
-                    positions, rotations, scales, opacities, colors = filter_by_opacity_threshold(
-                        positions, rotations, scales, opacities, colors, opacity_threshold
-                    )
+            if len(positions) == 0:
+                self._n_gaussians = 0
+                self._positions = None
+                self._data_changed = True
+                self.update()
+                return
 
-                if len(positions) == 0:
-                    self.set_data(None)
-                    return
+            # Apply depth sorting if view matrix is available
+            # This ensures correct alpha blending (back-to-front rendering)
+            if view_matrix is not None:
+                try:
+                    sort_indices = compute_depth_order(positions, view_matrix)
+                    positions = positions[sort_indices]
+                    rotations = rotations[sort_indices]
+                    scales = scales[sort_indices]
+                    opacities = opacities[sort_indices]
+                    colors = colors[sort_indices]
+                except Exception:
+                    # If depth sorting fails, continue without it
+                    pass
 
-                # Compute sizes based on scales (better than mean)
-                if scales is not None:
-                    sizes = compute_gaussian_sizes(scales, point_size_multiplier)
-                else:
-                    sizes = 10.0 * point_size_multiplier
+        except ImportError:
+            # If utils not available, proceed without filtering/sorting
+            pass
 
-                # Apply opacity to colors
-                if colors is not None and opacities is not None:
-                    face_colors = apply_opacity_to_colors(colors, opacities)
-                elif colors is not None:
-                    face_colors = colors
-                else:
-                    face_colors = np.ones((len(positions), 4))
-                    if opacities is not None:
-                        face_colors[:, 3] = opacities
+        # Store data
+        self._n_gaussians = len(positions)
+        self._positions = np.ascontiguousarray(positions, dtype=np.float32)
+        self._rotations = np.ascontiguousarray(rotations, dtype=np.float32)
+        self._scales = np.ascontiguousarray(scales, dtype=np.float32)
+        self._opacities = np.ascontiguousarray(opacities, dtype=np.float32)
+        self._colors = np.ascontiguousarray(colors, dtype=np.float32)
 
-                # Apply depth sorting if view matrix is available
-                # This ensures correct alpha blending (back-to-front rendering)
-                if view_matrix is not None:
-                    try:
-                        sort_indices = compute_depth_order(positions, view_matrix)
-                        positions = positions[sort_indices]
-                        face_colors = face_colors[sort_indices]
-                        if isinstance(sizes, np.ndarray):
-                            sizes = sizes[sort_indices]
-                        # Update stored data
-                        if self._rotations is not None:
-                            self._rotations = self._rotations[sort_indices]
-                        if self._scales is not None:
-                            self._scales = self._scales[sort_indices]
-                        if self._opacities is not None:
-                            self._opacities = self._opacities[sort_indices]
-                    except Exception:
-                        # If depth sorting fails, continue without it
-                        pass
+        # Update point size uniform
+        self.shared_program['u_point_size'] = float(point_size_multiplier)
 
-                self.set_data(
-                    pos=positions,
-                    face_color=face_colors,
-                    edge_color=None,
-                    size=sizes,
-                )
+        # Mark data as changed
+        self._data_changed = True
+        self.update()
 
-            except ImportError:
-                # Fallback to simple rendering if utils not available
-                if colors is not None:
-                    face_colors = np.column_stack([
-                        colors,
-                        opacities if opacities is not None else np.ones(len(positions))
-                    ])
-                else:
-                    face_colors = np.column_stack([
-                        np.ones((len(positions), 3)),
-                        opacities if opacities is not None else np.ones(len(positions))
-                    ])
+    def _prepare_transforms(self, view):
+        """Prepare transforms and update uniforms."""
+        # Update viewport size
+        if view.size is not None:
+            self.shared_program['u_viewport'] = tuple(view.size)
 
-                if scales is not None:
-                    sizes = np.mean(scales, axis=1) * 10.0 * point_size_multiplier
-                else:
-                    sizes = 10.0 * point_size_multiplier
+        # Get visual to canvas transform and extract view/projection
+        # In vispy's scene graph, we need to get the full transform
+        if hasattr(view, 'camera'):
+            # Get view matrix (camera transform)
+            view_mat = view.camera.view_matrix
+            proj_mat = view.camera.projection_matrix
 
-                self.set_data(
-                    pos=positions,
-                    face_color=face_colors,
-                    edge_color=None,
-                    size=sizes,
-                )
+            self.shared_program['u_view'] = view_mat
+            self.shared_program['u_projection'] = proj_mat
         else:
-            self.set_data(None)
+            # Fallback to identity matrices
+            self.shared_program['u_view'] = np.eye(4, dtype=np.float32)
+            self.shared_program['u_projection'] = np.eye(4, dtype=np.float32)
+
+    def _prepare_draw(self, view):
+        """Prepare for drawing."""
+        # Upload data to GPU if changed
+        if self._data_changed and self._positions is not None:
+            self._vbo_pos.set_data(self._positions)
+            self._vbo_rot.set_data(self._rotations)
+            self._vbo_scale.set_data(self._scales)
+            self._vbo_opacity.set_data(self._opacities)
+            self._vbo_color.set_data(self._colors)
+            self._data_changed = False
+
+        # Prepare transforms
+        self._prepare_transforms(view)
+
+    def _compute_bounds(self, axis, view):
+        """Compute bounds for camera auto-range."""
+        if self._positions is None or len(self._positions) == 0:
+            return None
+
+        # Use positions extended by maximum scale
+        if self._scales is not None:
+            max_scale = np.max(self._scales)
+            pos_min = np.min(self._positions, axis=0)
+            pos_max = np.max(self._positions, axis=0)
+            return (pos_min[axis] - max_scale, pos_max[axis] + max_scale)
+        else:
+            return (np.min(self._positions[:, axis]), np.max(self._positions[:, axis]))
+
+    def draw(self, transforms):
+        """Draw the visual."""
+        if self._n_gaussians == 0 or self._positions is None:
+            return
+
+        # Draw all Gaussians as points
+        Visual.draw(self, transforms)
+
+
+# Create scene-graph compatible wrapper
+GaussianMarkersNode = create_visual_node(GaussianMarkers)
