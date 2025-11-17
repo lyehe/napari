@@ -298,6 +298,8 @@ class GaussianMarkers(Markers):
         scales,
         opacities,
         colors,
+        view_matrix=None,
+        point_size_multiplier=1.0,
     ) -> None:
         """
         Set Gaussian splat data with all attributes.
@@ -314,37 +316,102 @@ class GaussianMarkers(Markers):
             Opacity values
         colors : array (N, 3)
             RGB colors
+        view_matrix : array (4, 4), optional
+            View matrix for depth sorting
+        point_size_multiplier : float
+            Global size multiplier
         """
         self._rotations = rotations
         self._scales = scales
         self._opacities = opacities
 
-        # For now, render as standard markers
-        # TODO: Implement custom shader attributes
+        # Enhanced rendering with depth sorting and better size calculation
         if positions is not None and len(positions) > 0:
-            # Modulate color by opacity
-            if colors is not None:
-                face_colors = np.column_stack([
-                    colors,
-                    opacities if opacities is not None else np.ones(len(positions))
-                ])
-            else:
-                face_colors = np.column_stack([
-                    np.ones((len(positions), 3)),
-                    opacities if opacities is not None else np.ones(len(positions))
-                ])
+            try:
+                from napari._vispy.visuals.gaussian_utils import (
+                    apply_opacity_to_colors,
+                    compute_depth_order,
+                    compute_gaussian_sizes,
+                    filter_by_opacity_threshold,
+                )
 
-            # Use mean scale as size approximation
-            if scales is not None:
-                sizes = np.mean(scales, axis=1) * 10.0  # Scale up for visibility
-            else:
-                sizes = 10.0
+                # Filter out very transparent Gaussians for performance
+                opacity_threshold = 0.01
+                if opacities is not None and np.any(opacities < opacity_threshold):
+                    positions, rotations, scales, opacities, colors = filter_by_opacity_threshold(
+                        positions, rotations, scales, opacities, colors, opacity_threshold
+                    )
 
-            self.set_data(
-                pos=positions,
-                face_color=face_colors,
-                edge_color=None,
-                size=sizes,
-            )
+                if len(positions) == 0:
+                    self.set_data(None)
+                    return
+
+                # Compute sizes based on scales (better than mean)
+                if scales is not None:
+                    sizes = compute_gaussian_sizes(scales, point_size_multiplier)
+                else:
+                    sizes = 10.0 * point_size_multiplier
+
+                # Apply opacity to colors
+                if colors is not None and opacities is not None:
+                    face_colors = apply_opacity_to_colors(colors, opacities)
+                elif colors is not None:
+                    face_colors = colors
+                else:
+                    face_colors = np.ones((len(positions), 4))
+                    if opacities is not None:
+                        face_colors[:, 3] = opacities
+
+                # Apply depth sorting if view matrix is available
+                # This ensures correct alpha blending (back-to-front rendering)
+                if view_matrix is not None:
+                    try:
+                        sort_indices = compute_depth_order(positions, view_matrix)
+                        positions = positions[sort_indices]
+                        face_colors = face_colors[sort_indices]
+                        if isinstance(sizes, np.ndarray):
+                            sizes = sizes[sort_indices]
+                        # Update stored data
+                        if self._rotations is not None:
+                            self._rotations = self._rotations[sort_indices]
+                        if self._scales is not None:
+                            self._scales = self._scales[sort_indices]
+                        if self._opacities is not None:
+                            self._opacities = self._opacities[sort_indices]
+                    except Exception:
+                        # If depth sorting fails, continue without it
+                        pass
+
+                self.set_data(
+                    pos=positions,
+                    face_color=face_colors,
+                    edge_color=None,
+                    size=sizes,
+                )
+
+            except ImportError:
+                # Fallback to simple rendering if utils not available
+                if colors is not None:
+                    face_colors = np.column_stack([
+                        colors,
+                        opacities if opacities is not None else np.ones(len(positions))
+                    ])
+                else:
+                    face_colors = np.column_stack([
+                        np.ones((len(positions), 3)),
+                        opacities if opacities is not None else np.ones(len(positions))
+                    ])
+
+                if scales is not None:
+                    sizes = np.mean(scales, axis=1) * 10.0 * point_size_multiplier
+                else:
+                    sizes = 10.0 * point_size_multiplier
+
+                self.set_data(
+                    pos=positions,
+                    face_color=face_colors,
+                    edge_color=None,
+                    size=sizes,
+                )
         else:
             self.set_data(None)

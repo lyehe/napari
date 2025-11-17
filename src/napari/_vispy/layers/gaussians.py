@@ -78,6 +78,20 @@ class VispyGaussiansLayer(VispyBaseLayer):
                     else:
                         scales = scales * scale_factors[:, None]
 
+        # Get view matrix for depth sorting
+        view_matrix = None
+        if hasattr(self.node, 'get_transform'):
+            try:
+                # Get the view transform from the parent
+                view_tr = self.node.get_transform('visual', 'canvas')
+                if hasattr(view_tr, 'matrix'):
+                    view_matrix = view_tr.matrix
+            except Exception:
+                pass  # Continue without view matrix
+
+        # Get point size multiplier from layer
+        point_size_multiplier = self.layer.point_size if hasattr(self.layer, 'point_size') else 1.0
+
         # Update the visual
         if hasattr(self.node.gaussian_markers, 'set_gaussian_data'):
             self.node.gaussian_markers.set_gaussian_data(
@@ -86,6 +100,8 @@ class VispyGaussiansLayer(VispyBaseLayer):
                 scales=scales,
                 opacities=opacities,
                 colors=colors,
+                view_matrix=view_matrix,
+                point_size_multiplier=point_size_multiplier,
             )
         else:
             # Fallback for simpler implementation
